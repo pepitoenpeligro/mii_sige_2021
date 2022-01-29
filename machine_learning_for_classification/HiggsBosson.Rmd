@@ -1,0 +1,649 @@
+---
+# 0.0. Metadatos del Rmd y configuración de la exportación
+title: "Pre-procesamiento y clasificación binaria"
+author: "José Antonio Córdoba Gómez"
+date: "4/6/2021"
+output:
+  pdf_document:
+    toc: yes
+    toc_depth: '2'
+    number_sections: yes
+---
+
+<!-- 0.1. Importación de librerias de R -->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE)
+library(httr)  
+library(knitr)
+library(tidyverse)
+library(funModeling)
+library(DataExplorer)
+library(caret)
+library(pROC)
+library(rpart.plot)
+```
+
+<!-- 1. Introducción -->
+
+# Introducción
+
+Durante el transcurso de este ejercicio práctico vamos a tratar de realizar tareas de pre-procesamiento vistas en clase sobre datos del experimento **ATLAS** del *CERN-LHC* donde se pretendía identificar de forma experimental la partícula del bosón de *Higgs*. El problema por tanto, consiste en poder clasificar de forma binaria si una lectura del experimento se correspondía con el decaimiento de un **bosón de Higgs** (objeto esperado) o **ruido de fondo**.
+
+Además, se tratará de aplicar sobre estos datos algunos algoritmos de aprendizaje automático con ayuda de la librería *caret* y realizaremos una pequeña comparación con los resultados que obtengamos
+
+Para concluir, se expondrán las conclusiones que hemos elaborado durante el transcurso del ejercicio práctico.
+
+# Obtención de datos
+
+El primer paso es obtener el conjunto de datos, para ello, vamos a basarnos en las funciones de la plantilla del ejercicio que encontramos en el repositorio de la asignatura.
+
+```{r obtencion_descarga}
+downloadAtlasData <- function (){
+  if(!file.exists("data/training.csv") || !file.exists("data/test.csv")) {
+    writeLines(sprintf("descargando {training.csv, test.csv} en: \n%s/data", getwd()))
+    url_datos <- "http://sl.ugr.es/higgs_sige"
+    GET(url_datos, write_disk(temp <- tempfile(fileext = ".zip")))
+    unzip(temp, exdir = "data")
+    unlink(temp)
+  }else{
+    writeLines(sprintf("training y test ya se encuentran en : \n%s/data", getwd()))
+  }
+}
+downloadAtlasData()
+```
+
+Una vez descargados los datos sobre el directorio *workingDirectyory/data/* necesitamos leer el conjunto de entrenamiento en una variable de R para poder explorar y preprocesar los datos.
+
+```{r obtencion_lectura}
+atlas_training_raw <- read_csv("data/training.csv")
+```
+
+Sabemos previamente que existen valores perdidos en el conjunto de datos que se han condificado con el valor **-999.0**, por lo que vamos a tratar de transformar estos valores perdidos al tipo nativo de R para esta semántica, que es **NA**, antes de realizar el análisis exploratorio del conjunto de datos.
+
+```{r obtencion_recodificar_na}
+atlas_training_raw <- atlas_training_raw %>%
+  na_if(-999.0)
+```
+
+# Análisis exploratorio
+
+## Naturaleza de los datos
+
+Vamos a comenzar realizando un resumen básico del conjunto de datos, que nos indicará valores mínimos, medios y máximos para cada una de las dimensiones, así como la distribución en los cuartiles y el número de valores perdidos (NAs) que ha identificado. Si no hubieramos recodificado en el paso anterior, este resumen sería irreal.
+
+```{r analisis_exploratorio_resumen}
+summary(atlas_training_raw)
+```
+
+Tras este resumen inicial, podemos observar como existen dimensiones con una gran cantidad (que no proporción, aunque la podemos calcular) de valores perdidos, como son:
+
+1.  DER_mass_MMC
+2.  DER_deltaeta_jet_jet
+3.  DER_prodeta_jet_jet
+4.  DER_lep_eta_centrality
+5.  PRI_jet_leading_pt
+6.  PRI_jet_leading_eta
+7.  PRI_jet_leading_phi
+8.  PRI_jet_subleading_pt
+9.  PRI_jet_subleading_eta
+10. PRI_jet_subleading_phi
+
+Es decir, cerca de un tercio de las dimensiones presentan una alta cantidad de valores perdidos, y de estos, la mayoría son valores primitivos sobre *jet*.\newline
+
+Además, podemos observar que todas las dimensiones son numéricas, exceptuando la dimensión de clase *Label*, que es de tipo carácter.
+
+A continuación vamos a tratar de observar más información sobre la naturaleza de los datos.
+
+```{r analisis_exploratorio_head}
+df_status(atlas_training_raw)
+```
+
+Pobservar como las dimensiones *PRI_jet_num* y *PRI_jet_all_pt* tienen una proporción de valores nulos del 40%.
+
+Vamos a tratar de estudiar a continuación la proporción de valores nulos, para ello vamos a mostrar un de forma gráfica cuál es esa propoción.
+
+```{r analisis_exploratorio_vervaloresnulos}
+plot_missing(atlas_training_raw)
+```
+
+Podemos observar que la proporción de valores perdidos (*p_na*) sobre las dimensiones
+
+1.  DER_deltaeta_jet_jet
+2.  DER_mass_jet_jet
+3.  DER_prodeta_jet_jet
+4.  DER_prodeta_jet_jet
+5.  DER_lep_eta_centrality
+6.  PRI_jet_subleading_pt
+7.  PRI_jet_subleading_eta
+8.  PRI_jet_subleading_phi
+
+es superior al 70% de los datos, una tasa altísima. \newline
+
+Por otra parte, las dimensiones
+1.  PRI_jet_leading_pt
+2.  PRI_jet_all_pt
+encuentran una proporción de valores perdidos cercana al 40%, no tan alta como la lista de dimensiones anterior, pero bastante notable. \newline
+
+
+
+
+Si aplicamos una eliminación de estos valores perdidos y nulos, podríamos ver el conjunto de datos gravemente reducido, con lo que la capacidad de generalización posterior se vería resentida.
+
+## ¿Balanceamiento o desbalanceamiento?
+
+Durante esta sección vamos a tratar de observar si el conjunto de datos tiene una proporcion balanceada o desbalanceada entre sus clases (entre si es el decaimiento del bosón o ruido).  
+
+
+En caso de que nos encontremos en una situación de desbalanceamiento, es decir, que una de las clases sea minoritaria, el proceso de aprendizaje que realicemos más tarde, se puede ver afectado, ya que en el proceso de generalización, la clase minoritaria se verá perjudicada.
+
+```{r balanceamiento_datos_numericos}
+table(atlas_training_raw$Label)
+```
+Con la proporción numérica se puede observar correctamente, como por desgracia, las clases están desbalanceadas. Vamos a mostrarlo de forma gráfica y seguir el conocimiento popular de que *una imagen vale más que mil palabras* para comprender de un vistazo este desbalanceamiento.
+
+```{r balanceamiento_grafica, warning=FALSE}
+ggplot(atlas_training_raw) +
+geom_histogram(
+  aes(x = Label, fill = as.factor(Label)), stat = "count") +
+  labs(x = "", y = "") +
+  scale_fill_discrete(name ="Clase", labels=c("(b)ackground", "higg(s)")
+)
+```
+
+
+Este hecho puede implicar que tengamos que plantear alguna estrategia para manejar datos desbalanceados durante el proceso de clasificación automática.
+
+
+## Correlaciones
+
+De forma inicial podemos echar un vistazo sobre las correlaciones que existen entre las diferentes variables.
+```{r correlation_plot, eval=FALSE}
+plot_correlation(atlas_training_raw)
+```
+El gráfico anterior es dificil de estudiar debido al alto número de dimensiones que existen en el conjunto de datos, pero de un primer vistazo, podemos ver que existen algunas dimensiones con una alta correlación tanto directa como indirecta, como puede ser *DER_pt_ratio_lep_tau* y *DER_mass_transverse_met_lep* o  *PRI_tau_pt*, *DER_met_phi_centrality* y *DER_pt_h*.
+
+
+
+## Detección de Outliers
+
+Dentro del conjunto de datos pueden existir observaciones que sean representativas de la población, pudiendo así, distorsionar el resultado del aprendizaje. Por tanto, vamos a tratar de echar un vistazo a estos valores atípicos dentro de nuestro conjunto de datos.
+
+
+```{r outliers, fig.align = "center", fig.height = 3.5, fig.width = 3.5,}
+for (i in 1:length(atlas_training_raw)) {
+  if(i!=33)
+    boxplot(atlas_training_raw[,i],
+            main=names(atlas_training_raw[i]),
+            type="l")
+}
+```
+
+Podemos observar que dimensiones como:
+
+1. DER_mass_MMC
+2. DER_mass_transverse_met_lep
+3. DER_mass_vis
+4. DER_pt_h
+5. DER_mass_jet_jet
+6. DER_prodeta_jet_jet
+7. DER_pt_tot
+8. DER_sum_pt
+9. DER_pt_ratio_lep_tau
+10. PRI_tau_pt
+11. PRI_lep_pt
+12. PRI_met
+13. PRI_met_sumet
+14. PRI_jet_leading_pt
+15. PRI_jet_subleading_pt
+16. PRI_jet_all_pt
+
+muestran a primera vista que contienen una gran proporción de outliers. Como son muchísmas dimensiones que presentan esta problemática, una sustracción de estos valores atípicos nos puede causar una disminución drástica del conjunto de observaciones, viendose de nuevo, afectado gravemente el proceso de generalización.
+
+# Preprocesamiento
+
+## Tratando valores perdidos
+Anteriormente ya realizamos una recodificación de los valores perdidos, pero no decidimos qué realizar con ellos. Comentamos que una eliminación de éstos, puede implicar un empeoramiento notorio en el proceso de generalización. Otra opción sería realizar una sustitución de estos valores perdidos por otros valores como la mediana o la media. Esta segunda opción tampoco está exenta de problemática, ya que adultera el conjunto de datos, por valores que pueden no tener nada que ver y que también pueden influir en el conjunto de datos.
+
+Por lo tanto, vamos a decidir eliminar los valores perdidos, ya que considero mejor perder datos que adulterarlos. Esto es debido a que como son datos experimentales, podríamos realizar una captura mayor de datos y minimizar este posible impacto, mientras que la segunda opción podría alterar de forma irremediable el resultado final de la generalización.
+
+Como vimos anteriormente en el análisis exploratorio de los datos, existían dimensiones con un 70% de los valores perdidos, por lo que vamos a eliminarlos, tal y como hemos dicho anteriormente. Para ello vamos a introducir en una columna todas las dimensiones que cumplan el filtro de que la proporcion  de valores perdidos superen el 70%.
+
+```{r preprocesamiento_seleccionar_valores_perdidos}
+dimensiones_nas <- df_status(atlas_training_raw) %>%
+  filter(p_na > 70) %>%
+  select(variable)
+```
+
+
+Por tanto, aplicamos la reducción de dimensionalidad y creamos un conjunto de datos nuevo llamado *atlas_training* sobre el que vamos a realizar posteriormente las tareas de generalización.
+
+```{r preprocesamiento_eliminar_dimensiones_nas}
+atlas_training <- atlas_training_raw %>%
+  select(-one_of(dimensiones_nas$variable))
+```
+
+```{r preprocesamiento_mostrar_dimensiones_reducidas}
+dimensions <- data.frame(ncol(atlas_training_raw),ncol(atlas_training))
+dimensions
+```
+
+Como podemos apreciar, el conjunto de datos ha visto su dimensionalidad reducida en 7 dimensiones al haber eliminado las columnas:
+
+```{r preprocesamiento_mostrar_reduccion}
+dimensiones_nas
+```
+Ahora vamos a realizar la eliminación de las instancias correspondientes a los valores perdidos
+
+```{r preprocesamiento_valores_perdidos}
+atlas_training <- na.omit(atlas_training)
+valores_perdidos <- data.frame(nrow(atlas_training_raw),nrow(atlas_training))
+valores_perdidos
+```
+
+Podemos observar que hemos reducido el conjunto de datos de forma drástica y hemos obtendo cerca del 55% de los datos originales. Vamos a ser consecuentes con la decisión tomada anteriormente y ya veremos qué ocurre en el proceso de generalización por haber tomado esta decisión.
+
+## Tratamiento de valores nulos
+
+También podríamos realizar un tratamiendo de las dimensiones que contengan una alta proporción de datos nulos, pero en este caso, en la exploración previa no detectamos una alta proporción de valores nulos, por lo que no vamos a reducir aún más, el conjunto de datos.
+
+Tampoco vamos a reducir el conjunto de datos por la proporción de valores únicos ya que el conjunto de datos no presenta gran proporción de los mismo.
+<!-- 
+dif_cols <- status %>%
+  filter(unique > 0.8 * nrow(atlas_training)) %>%
+  select(variable)
+-->
+
+
+## Discretización
+
+Realizar una discretización sobre el conjunto de datos que tenemos debería estar respladado por un conocimiento extenso del dominio del problema, ya que en caso contrario, tomar decisiones de agrupación en categorías de ciertas variables podría carecer de semántica en este conjunto de datos y perjudicar seriamente al proceso de aprendizaje. Es por este motivo que descartamos el proceso de discretización de variables.
+
+
+
+## Normalización
+
+Tal y como pudimos observar en la fase de análisis exploratorio, el conjunto de datos contiene dimensiones que contienen distribuciones muy diferentes entre sí y con valores muy dispersos. Por tanto, esto motiva que realicemos un proceso de normalización de las diferentes variables que podemos encontrar en el conjunto de datos entre valores [0,1].
+
+
+```{r preprocesamiento_normalizacion_funcion}
+normalizeAtlas <- function(x) {
+  (x - min(x)) / (max(x) - min(x))
+}
+```
+
+
+```{r preprocesamiento_normalizacion}
+for(i in 1:length(atlas_training[-1])) 
+  atlas_training[,i] <- normalizeAtlas(atlas_training[,i])
+
+head(atlas_training, n = 10)
+```
+
+## Análisis de Correlaciones
+Como vimos anteriormente, existen algunas dimensiones que presentan correlaciones bastante fuertes, por lo que pueden presentar una alta relevancia a la hora de realizar el aprendizaje y predecir el valor final de la variable de clase.
+
+Vamos a crear un dataframe nuevo que incluya todas las 26 columnas que teníamos hasta el momento menos la columna de clase. Con ello, vamos a seleccionar aquellas dimensiones que presenten, en valor absoluto (para incluir las correlaciones directas e inversas), una correlación superior o igual al 25%
+
+```{r correlaciones_ajuste}
+atlas_training_cor <- atlas_training[1:length(atlas_training)-1]
+cor_mat <- cor(atlas_training_cor)
+cor_mat[!lower.tri(cor_mat)] <- NA # remove diagonal and redundant values
+colums_i_want <-data.frame( cor_mat) %>%
+              rownames_to_column() %>%
+              gather(key="variable", value="correlation", -rowname) %>%
+              filter(abs(correlation) >= 0.25) %>%
+              filter(rowname != 'Weight')
+
+unique(colums_i_want['rowname'])
+```
+
+Como podemos observar, terminaríamos con un total de 14 dimensiones, sin contar la variable de clase, que serían 15.
+
+```{r correlaciones_reduccion}
+
+atlas_training_only_label <- data.frame(atlas_training$Label)
+
+atlas_training <- atlas_training_cor %>%
+  select(one_of(colums_i_want$rowname))
+
+unique(colums_i_want$rowname)
+atlas_training['Label'] <- atlas_training_only_label
+```
+
+
+# Clasificación
+
+## Introducción
+
+Llegados a este punto del documento tenemos ya los datos procesados con nuestro criterio, por lo que podemos comenzar con la tarea de aprendizaje y generalización. Para ello, tenemos multiples algoritmos de aprendizaje como son:
+
+1. Random Forest
+2. Árboles de decisión
+3. Redes Neuronales Artificiales
+
+
+
+### Metodología
+
+Como aprendimos en la asignatura anterior (TID), primero realizaremos una partición del conjunto de datos ya procesados en dos partes. El primer segmento lo denominaremos de entrenamiento y contendrá una proporción del 70% de los datos iniciales, y el segundo segmento, se denominará de test y contendrá el 30% de los datos restantes.
+
+Esta partición se realizará de forma repetida y se la introduciremos al clasificador de forma repetida, disminuyendo la aleatoriedad de la entrada (*Cross Validation*).
+
+A la salida del clasficador tendremos que adjuntar su precisión y valorar la tasa de falsos positivos y verdaderos positivos y estimar si el desbalanceo de las clases ha supuesto un gran problema al clasificador. También será necesario analizar el área que nos deja la curva ROC sobre el conjunto de validación.
+
+Por último será necesario evaluar cuán bueno ha sido este proceso de generalización entregándole como entrada al clasificador el conjunto de test.
+
+
+### Particionamiento de los datos y 'Cross Validation'
+
+Aplicando la metodología anteriormente expuesta, realizamos una particion 70-30 de los datos.
+
+```{r clasificacion_particion}
+set.seed(1000)
+
+particion     <- createDataPartition(as.factor(atlas_training$Label), p=0.7, list=FALSE)
+
+entrenamiento <- atlas_training[particion,  ]
+test          <- atlas_training[-particion, ]
+```
+
+Y aplicamos el conjunto de validación cruzada de 5.
+
+```{r clasificacion_cv}
+cv <- trainControl(verboseIter = TRUE, classProbs = TRUE, summaryFunction = twoClassSummary, method = "cv", number = 5)
+```
+
+
+## Random Forest
+
+```{r randomforest_entrenamiento}
+randomForest <- train(Label ~ ., data = entrenamiento, metric = "ROC", method = "rf",  trControl = cv)
+```
+
+Una vez completado el proceso de aprendizaje, podemos evaluar el desempeño de este modelo sobre el conjunto de evaluación con una matriz de confusión, sabiendo que cada columna de la matriz representa el número de predicciones de cada clase, mientras que cada fila representa a las instancias en la clase real.
+
+```{r randomforest_matrizconfusion}
+randomForestPrediccion <- predict(randomForest, test)
+randomForestMatrizConfusion <- confusionMatrix(table(randomForestPrediccion, test[["Label"]]))
+randomForestMatrizConfusion
+```
+
+Como podemos observar, nos devuelve una precisión del 79%. Un dato importante es el 'Balanced Accuracy' que nos indica la existencia de desbalanceo entre las clases, algo que ya pudimos entrever en el análisis exploratorio de datos. Sería interesante realizar alguna técnica de balanceamiento  para solucionar esta cuestión.
+
+
+A continuación vamos a tratar de representar de forma gráfica la sensibilidad frente a la especifidad del clasificador binario según varíe el umbral de discriminación, o lo que es lo mismo, la proporción de verdaderos positivos frente a la proporción de falsos negativos en variación del mbral de discriminación. Recordemos que el umbral de discriminación es el valor a partir el cuál decidimos que un caso es un positivo.
+
+
+```{r randomforest_roc}
+randomForestAUC <- predict(randomForest, test, type = "prob")
+randomForestROC <- roc(test$Label, randomForestAUC[["s"]], levels = unique(test[["Label"]]))
+radnomForestROCplot <- plot.roc(randomForestROC, ylim=c(0,1), type = "S" , print.thres = T, main=paste('Validation AUC:', round(randomForestROC$auc[[1]], 2)))
+```
+Como podemos observar en el anterior gráfico, el área de la curva es de 0.87, es decir, cercano al 0.9, por lo que se estima que el test es muy bueno.
+
+
+
+## Árboles de decisión
+
+Durante esta sección vamos a tratar crear otro modelo de clasificación a partir de otro de los algoritmos de aprendizaje supervisado que nos proporciona *caret*, que es el árbol de decisión. La decisión de tomar este algoritmo de aprendizaje se basa en la naturalez de los datos, en que nos devolvería un conjunto de reglas a partir de las cuales podríamos tomar futuras decisiones y que no es un algoritmo computacionalmente excesivamente costoso.
+
+```{r arboldecision_entrenamiento}
+arbolDeDecision <- train(Label ~ ., data = entrenamiento, metric = "ROC", method = "rpart",  trControl = cv)
+```
+
+```{r arboldecision_confusion}
+arbolDeDecisionPrediccion <- predict(arbolDeDecision, test)
+arbolDeDecisionMatrizConfusion <- confusionMatrix(table(arbolDeDecisionPrediccion, test[["Label"]]))
+arbolDeDecisionMatrizConfusion
+```
+
+Como podemos observar, el rendimiento del clasificador es menor al del *random forest*, aunque presenta un menor valor de *balanced accuracy*.
+
+```{r arboldecision_roc}
+arbolDeDecisionAUC <- predict(arbolDeDecision, test, type = "prob")
+arbolDeDecisionROC <- roc(test$Label, arbolDeDecisionAUC[["s"]], levels = unique(test[["Label"]]))
+arbolDeDecisionROCplot <- plot.roc(arbolDeDecisionROC, ylim=c(0,1), type = "S" , print.thres = T, main=paste('Validation AUC:', round(arbolDeDecisionROC$auc[[1]], 2)))
+```
+
+En este caso, también notamos un desempeño más bajo del test, siendo de calidad media.
+
+
+## KNN
+
+Vamos a tratar de aplicar el algoritmo KNN a nuestro conjunto de datos en busca de un mejor modelo.
+
+```{r knn_entrenamiento}
+knn <- train(Label ~ ., data = entrenamiento, metric = "ROC", method = "knn",  trControl = cv)
+```
+
+
+```{r knn_matrizconfusion}
+knnPrediccion <- predict(knn, test)
+knnMatrizConfusion <- confusionMatrix(table(knnPrediccion, test[["Label"]]))
+knnMatrizConfusion
+```
+
+```{r knn_roc}
+knnAUC <- predict(knn, test, type = "prob")
+knnROC <- roc(test$Label, knnAUC[["s"]], levels = unique(test[["Label"]]))
+knnROCplot <- plot.roc(knnROC, ylim=c(0,1), type = "S" , print.thres = T, main=paste('Validation AUC:', round(knnROC$auc[[1]], 2)))
+```
+
+
+## Redes Neuronales Artificiales
+
+Llegados a este punto, vamos a aplicar el uso de redes neuronales aritifical con la esperanza de encontrar un sistema de clasificación mejor que los vistos hasta el momento. La motivación nace en que las redes neuronales sobresalen en áreas donde la detección de características es dificil de expresar o está oculta, ideal para nuestro caso.
+
+
+```{r rnn_entrenamiento}
+rnn <- train(Label ~ ., data = entrenamiento, metric = "ROC", method = "nnet",  trControl = cv)
+```
+
+
+```{r rnn_matrizconfusion}
+rnnPrediccion <- predict(rnn, test)
+rnnMatrizConfusion <- confusionMatrix(table(rnnPrediccion, test[["Label"]]))
+rnnMatrizConfusion
+```
+
+Como podemos observar, el modelo de red neuronal obtiene una precisión del 78% con una precisión del balanceo del 77%. Aunque son mejores parámetros que en el caso del árbol de decisión, son algo menores al modelo basado en *random forest*.
+
+```{r rnn_roc}
+rnnAUC <- predict(rnn, test, type = "prob")
+rnnROC <- roc(test$Label, rnnAUC[["s"]], levels = unique(test[["Label"]]))
+rnnROCplot <- plot.roc(rnnROC, ylim=c(0,1), type = "S" , print.thres = T, main=paste('Validation AUC:', round(rnnROC$auc[[1]], 2)))
+```
+
+Para el área bajo la curva, obtenemos un valor de 0.86, mucho mejor que el del árbol de decisión, pero peor que el del *random  forest*.
+
+
+
+## Comparativa
+
+```{r comparativa}
+columnas <- c("Random Forest", "Árbol de decisión", "KNN", "Redes Neuronales Artificiales")
+precision <- c("79%", "69%","70%", "78%")
+auc <- c("0.87", "0.71", "0.76", "0.86")
+balanceo <- c("0.78","0.67","0.69", "0.77")
+
+comparativa <- data.frame(columnas, precision, auc, balanceo)
+knitr::kable(comparativa, "pipe")
+```
+
+
+# Balanceamiento
+
+
+Como hemos podido observar en la anterior comparativa, todos los modelos pecaban de un desbalanceo muy alto. Esta cuestión ya se podía ver de venir desde el análisis exploratorio de datos, pero aún así, decidimos continuar para ver qué podía ocurrir en forma de aprendizaje (nuestro, como estudiante).
+
+Por ello, vamos a tratar de realizar un proceso de reducción de las observaciones de tal forma que se igualen (se balanceen) las clases y repetiremos de nuevo la ejecución de los algoritmos de aprendizaje automático.
+
+```{r balanceamiento}
+set.seed(0)
+
+entrenamiento$Label <- as.factor(entrenamiento$Label)
+entrenamientoBalanceadoReducido <- downSample(x  = entrenamiento, y = entrenamiento$Label)
+#entrenamientoBalanceadoReducido<- NULL
+
+indiceBalanceado <- createDataPartition(entrenamientoBalanceadoReducido$Label, p = .7, list = FALSE)
+entranmientoBalanceadoDatos <- entrenamientoBalanceadoReducido[indiceBalanceado, ]
+testBalanceadoDatos   <- entrenamientoBalanceadoReducido[-indiceBalanceado, ]
+
+entranmientoBalanceadoDatos['Class']<-NULL
+
+
+#cvBalanceado <- trainControl(verboseIter = TRUE, classProbs = TRUE, summaryFunction = twoClassSummary, method = "cv", number = 5)
+
+
+
+
+```
+ 
+A continuación podemos ver como el conjunto de datos se encuentra balanceado con el mismo número de elementos de clase bosón y ruido de fondo.
+
+```{r balanceamiento_estadoActual}
+ggplot(entrenamientoBalanceadoReducido) +
+geom_histogram(
+  aes(x = Label, fill = Label), stat = "count") +
+  labs(x = "", y = "") +
+  scale_fill_discrete(name ="Clase", labels=c("(b)ackground", "higg(s)")
+)
+```
+
+
+## Random Forest
+
+
+```{r randomforest_entrenamientoBalanceado}
+randomForestBalanceado <- train(Label ~ ., data = entranmientoBalanceadoDatos, metric = "ROC", method = "rf",  trControl = cv)
+```
+
+
+```{r randomforestBalanceado_matrizconfusion}
+randomForestBalanceadoPrediccion <- predict(randomForestBalanceado, testBalanceadoDatos)
+randomForestBalanceadoMatrizConfusion <- confusionMatrix(table(randomForestBalanceadoPrediccion, testBalanceadoDatos[["Label"]]))
+randomForestBalanceadoMatrizConfusion
+```
+
+
+```{r randomforestBalanceado_roc}
+randomForestBalanceadoAUC <- predict(randomForestBalanceado, testBalanceadoDatos, type = "prob")
+randomForestBalanceadoROC <- roc(testBalanceadoDatos$Label, randomForestBalanceadoAUC[["s"]], levels = unique(testBalanceadoDatos[["Label"]]))
+randomForestBalanceadoROCplot <- plot.roc(randomForestBalanceadoROC, ylim=c(0,1), type = "S" , print.thres = T, main=paste('Validation AUC:', round(randomForestBalanceadoROC$auc[[1]], 2)))
+```
+
+Podemos ver como la curva ROC ha mejorado algo, apuntándose ahora a 0.88
+
+
+
+
+
+## KNN
+
+
+De nuevo, vamos a hacer lo propio con el modelo KNN creando un nuevo modelo a partir del conjunto de datos resultantes del balanceo.
+
+```{r knn_entrenamiento_balanceado}
+knnBalanceado <- train(Label ~ ., data = entranmientoBalanceadoDatos, metric = "ROC", method = "knn",  trControl = cv)
+```
+
+
+```{r knn_matrizconfusion_balanceado}
+knnPrediccionBalanceado <- predict(knnBalanceado, test)
+knnMatrizConfusionBalanceado <- confusionMatrix(table(knnPrediccionBalanceado, test[["Label"]]))
+knnMatrizConfusionBalanceado
+```
+
+```{r knn_roc_balanceado}
+knnBalanceadoAUC <- predict(knnBalanceado, testBalanceadoDatos, type = "prob")
+knnBalanceadoROC <- roc(testBalanceadoDatos$Label, knnBalanceadoAUC[["s"]], levels = unique(testBalanceadoDatos[["Label"]]))
+knnBalanceadoROCplot <- plot.roc(knnBalanceadoROC, ylim=c(0,1),
+                                 type = "S" , print.thres = T, main=paste('Validation AUC:', round(knnBalanceadoROC$auc[[1]], 2)))
+```
+
+
+
+
+
+
+
+
+
+
+
+## Redes Neuronales Artificiales
+
+Vamos a volver a las redes neuronales para ver qué tal se comportan con este balanceo.
+
+```{r rnn_entrenamiento_balanceado}
+rnnBalanceado <- train(Label ~ ., data = entranmientoBalanceadoDatos, metric = "ROC", method = "nnet",  trControl = cv)
+```
+
+
+```{r rnn_matrizconfusion_balanceado}
+rnnBalanceadoPrediccion <- predict(rnnBalanceado, testBalanceadoDatos)
+rnnBalanceadoMatrizConfusion <- confusionMatrix(table(rnnBalanceadoPrediccion, testBalanceadoDatos[["Label"]]))
+rnnBalanceadoMatrizConfusion
+```
+Podemos observar que eha empeorado el resultado, quedándose en un 77% de precisión.
+
+```{r rnn_roc_balanceado}
+rnnBalanceadoAUC <- predict(rnnBalanceado, testBalanceadoDatos, type = "prob")
+rnnBalanceadoROC <- roc(testBalanceadoDatos$Label, rnnBalanceadoAUC[["s"]], levels = unique(testBalanceadoDatos[["Label"]]))
+rnnBalanceadoROCplot <- plot.roc(rnnBalanceadoROC, ylim=c(0,1), type = "S" , print.thres = T, main=paste('Validation AUC:', round(rnnBalanceadoROC$auc[[1]], 2)))
+```
+
+Sin embargo el área bajo la curva, ha mejorado con un 0.85.
+
+
+## Comparativa
+
+```{r comparativaBalanceada}
+columnas <- c("Random Forest", "KNN", "Redes Neuronales Artificiales")
+precision <- c("79%", "68%","77%")
+auc <- c("0.79", "0.68", "0.68")
+balanceo <- c("0.88","0.75", "0.85")
+
+comparativa <- data.frame(columnas, precision, auc, balanceo)
+knitr::kable(comparativa, "pipe")
+```
+
+
+# Conclusiones
+
+
+
+Respecto a los modelos de clasificación obtenidos con los algoritmos de aprendizaje supervisado que hemos empleado podemos decir que:
+
+1. Ambos árboles de decisión no han llegado a obtener grandes resultados en su precisión. Quizás un ajuste en los parámetros de entrenamiento pueda variar algo este resultado, pero debido al rendimiento inicial, no creo que sean muy prósperos.
+2. Los modelos de KNN sobre este problema alcanzan unos valores buenos de predicción, aunque no son los mejores datos a obtener, sin embargo, su ejecución es algo más ligera luego ha merecido la pena realizarlo.
+3. Los modelos basados en la red neuronal artificial obtiene también buenos valores de predicción. Quizás un ajuste en los parámetros de entrenamiento si puedan significar una mejoraía notable.
+4. El mejor modelo alcanzado ha sido con **Random Forest**.
+
+Respecto al ejercicio en sí:
+1. El preprocesamiento es vital, ya que de éste depende el proceso de generalización y por tanto los modelos que obtengamos.
+2. El balanceo de datos ha aportado una mejora prácticamente residual en este caso respecto a la precisión, pero sí que es cierto que hemos aumentado los valores bajo la curva, lo que nos indica que reducimos los falsos positivos y los falsos negativos, etiquetando mejor por tanto la clase final.
+3. Quizás un conocimiento físico sobre el conjunto de datos pueda dar un mejor resultado al saber con conocimiento exporto, qué variables merecen más la pena, o si hay categorías que merezca la pena discretizar (siempre respetando la semántica de los datos).
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Referencias
+
+[1] [Repositorio de la asignatura](https://github.com/jgromero/sige2021)
+[2] [Modelos y entrenamiento con caret](https://topepo.github.io/caret/model-training-and-tuning.html)
+[3] [NNET con caret](https://www.cienciadedatos.net/documentos/41_machine_learning_con_r_y_caret)
+[4] [Árboles de decisión](https://rpubs.com/jboscomendoza/arboles_decision_clasificacion)
+[5] [DownSampling](https://www.rdocumentation.org/packages/caret/versions/6.0-86/topics/downSample)
+[6] [Normalize](https://www.rdocumentation.org/packages/igraph/versions/1.2.6/topics/normalize)
